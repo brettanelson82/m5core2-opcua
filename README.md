@@ -155,6 +155,4 @@ with one small local change (see [its README](components/open62541/README.md)).
 ## Next step: certificates
 
 Security is **None** for now, so anyone on your network can read and write.
-The next stage is adding the Basic256Sha256 *Sign & Encrypt* endpoint with a
-device certificate. That means regenerating the open62541 library with
-encryption (mbedTLS) turned on and adding certificate storage.
+The next stage is adding the Basic256Sha256 *Sign & Encrypt* endpoint
