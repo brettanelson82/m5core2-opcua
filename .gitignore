@@ -1,0 +1,17 @@
+# Build output and generated config
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Your Wi-Fi name and password (created from main/wifi_config.example.h)
+main/wifi_config.h
+
+# Machine-specific VS Code settings (COM port, ESP-IDF path); keep the
+# extension recommendations
+.vscode/*
+!.vscode/extensions.json
+
+# Local notes and drafts, not part of the project
+drafts/

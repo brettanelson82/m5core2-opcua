@@ -1,0 +1,4 @@
+## Libraries downloaded automatically on the first build
+dependencies:
+  idf: ">=5.1"
+  m5stack/m5unified: ">=0.2.10"
