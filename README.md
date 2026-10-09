@@ -117,6 +117,7 @@ main/
   wifi_config.example.h  template for it
   main.cpp          sensors, touch buttons, screen drawing
   opcua_server.c    OPC UA address space and server
+  ns0_fixups.c      fills standard (namespace 0) values left empty by this open62541 build
   wifi_net.c        Wi-Fi connection and clock sync
   device_state.h    data shared between the screen and the server
 components/open62541/   OPC UA stack (single-file build, see its README)
@@ -142,6 +143,7 @@ partitions.csv      6 MB app partition
 | *"Make sure you have the esptool.py installed and set in $PATH"* when choosing a port | The extension has no ESP-IDF selected. Run **ESP-IDF: Select Current ESP-IDF Version**, pick v5.5.x, then reload the window. |
 | Flashing says *Could not open COM port, the port is busy* | The serial monitor is still open. Close it (`Ctrl+]` in its terminal) and flash again. |
 | Matrikon OPC UA Explorer times out on *Find Servers* | Fixed in `opcua_server.c` (`verifyRequestTimestamp = UA_RULEHANDLING_ACCEPT`). Matrikon sends requests without a timestamp, and open62541 rejects those by default. |
+| ABB 800xA (or another strict client) rejects a standard node such as `i=12874` (`Server.ResendData` InputArguments) for having a null data type | Fixed in `main/ns0_fixups.c`. This open62541 build has XML encoding off, which leaves about 30 standard namespace-0 values empty and untyped; the firmware fills them in at startup. |
 | Wi-Fi keeps dropping (IP disappears from the screen) | The serial monitor shows `disconnected (reason N, rssi …)`. Keep the Core2 away from the laptop and USB 3 ports, which interfere with 2.4 GHz. On mesh routers, use a separate 2.4 GHz IoT network, or turn off client steering / 802.11r. |
 | Clock shows *not set* | The Core2 needs internet access for NTP on the first boot. After that the RTC keeps time. |
 

@@ -36,12 +36,13 @@
 #include "open62541.h"
 #include "opcua_server.h"
 #include "device_state.h"
+#include "ns0_fixups.h"
 
 #define OPCUA_PORT          4840     /* standard OPC UA TCP port */
 #define UPDATE_INTERVAL_MS  250      /* how often g_state and the nodes are synced */
 #define NAMESPACE_URI       "urn:m5stack:core2:opcua"
 #define APPLICATION_URI     "urn:m5stack:core2:opcua:server"
-#define FIRMWARE_VERSION    "1.0.0"
+#define FIRMWARE_VERSION    "1.0.1"  /* keep in step with CHANGELOG.md */
 
 /* Namespace index of NAMESPACE_URI. Set when the namespace is registered in
  * opcua_server_run() (it comes out as 2); every node in this file uses it. */
@@ -540,6 +541,10 @@ void opcua_server_run(void) {
         printf("[opcua] could not create server (out of memory?)\n");
         return;
     }
+    /* Strict clients (e.g. ABB 800xA) reject standard nodes whose value is
+     * empty in this open62541 build; give them proper values (ns0_fixups.c) */
+    ns0_fill_missing_values(server);
+
     ns = UA_Server_addNamespace(server, NAMESPACE_URI);
 
     buildAddressSpace(server);
