@@ -9,6 +9,7 @@ endif()
 
 idf_component_register(
     SRCS "main.cpp" "opcua_server.c" "wifi_net.c" "ns0_fixups.c"
+         "opcua_security.c" "security_store.c"
     INCLUDE_DIRS "."
     REQUIRES open62541 esp_wifi esp_netif esp_event esp_timer nvs_flash lwip esp_pm
 )

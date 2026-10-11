@@ -10,7 +10,8 @@
  *      ├─ Microphone  SoundLevel, Enabled*
  *      ├─ Touch       ButtonA/B/C, ButtonA/B/CCount, IsTouched, X, Y
  *      ├─ Clock       RtcTime
- *      ├─ System      Uptime, FreeHeap, WifiRssi, IpAddress, ClientCount
+ *      ├─ System      Uptime, FreeHeap, WifiRssi, IpAddress, ClientCount,
+ *      │              FirmwareVersion, DeviceId, SecurityEnabled
  *      ├─ Display     Value*, Label*, Unit*, Brightness*, Page, IdleTimeout*, Asleep
  *      ├─ Lights      On*, Red*, Green*, Blue*, Brightness*  (also set from the screen)
  *      └─ Outputs     Vibrate(DurationMs)  <- method
@@ -33,16 +34,22 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "esp_heap_caps.h"
+
 #include "open62541.h"
 #include "opcua_server.h"
 #include "device_state.h"
 #include "ns0_fixups.h"
+#include "opcua_security.h"
 
 #define OPCUA_PORT          4840     /* standard OPC UA TCP port */
 #define UPDATE_INTERVAL_MS  250      /* how often g_state and the nodes are synced */
 #define NAMESPACE_URI       "urn:m5stack:core2:opcua"
-#define APPLICATION_URI     "urn:m5stack:core2:opcua:server"
-#define FIRMWARE_VERSION    "1.0.1"  /* keep in step with CHANGELOG.md */
+/* ApplicationUri (which server this is), filled in with the device ID. The
+ * NAMESPACE_URI above stays the same on every device: it says what kind of
+ * nodes these are, so client configurations work for any Core2. */
+#define APPLICATION_URI_FMT "urn:m5stack:core2:opcua:%s:server"
+#define FIRMWARE_VERSION    "1.1.0"  /* keep in step with CHANGELOG.md */
 
 /* Namespace index of NAMESPACE_URI. Set when the namespace is registered in
  * opcua_server_run() (it comes out as 2); every node in this file uses it. */
@@ -333,6 +340,10 @@ static void updateCallback(UA_Server *server, void *data) {
     }
     wByte(server, "Lights.Brightness", s.lights_brightness);
     lastLightsBrightness = s.lights_brightness;
+
+    /* 4. Security: offer newly rejected client certificates for approval on
+     *    the screen, and carry out the user's answers */
+    opcua_security_poll(server);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -429,6 +440,13 @@ static void buildAddressSpace(UA_Server *server) {
     addUInt32(server, "System", "System.ClientCount", "ClientCount", "Number of connected OPC UA sessions");
     addString(server, "System", "System.FirmwareVersion", "FirmwareVersion", "Firmware version",
               FIRMWARE_VERSION, false);
+    addString(server, "System", "System.DeviceId", "DeviceId",
+              "Last 3 bytes of the MAC address; part of the hostname and ApplicationUri",
+              s.device_id, false);
+    UA_Boolean secOn = s.security_on;
+    addVariable(server, "System", "System.SecurityEnabled", "SecurityEnabled",
+                "True if secure endpoints (certificates) are offered; switched on the Core2 screen",
+                &UA_TYPES[UA_TYPES_BOOLEAN], &secOn, false);
 
     addObject(server, "M5Core2", "Display", "Display", "What the screen shows (writable by clients)");
     UA_Double dv = s.display_value;
@@ -511,11 +529,34 @@ static void setString(UA_String *dst, const char *src) {
 void opcua_server_run(void) {
     UA_ServerConfig config;
     memset(&config, 0, sizeof(config));
-    /* One endpoint on port 4840, SecurityPolicy None (certificates come later) */
-    UA_ServerConfig_setMinimal(&config, OPCUA_PORT, NULL);
+
+    /* Endpoints on port 4840. Security off: None only. Security on (set on the
+     * screen, applied at start-up): None plus the secure endpoints, see
+     * opcua_security.c. If secure setup fails, fall back to None only. */
+    state_lock();
+    bool wantSecure = g_state.security_on;
+    char ip[sizeof(g_state.ip_address)];
+    strcpy(ip, g_state.ip_address);
+    char deviceId[sizeof(g_state.device_id)];
+    strcpy(deviceId, g_state.device_id);
+    state_unlock();
+
+    /* ApplicationUri: unique per device (device ID = end of the MAC), so
+     * several Core2s on one network are told apart by clients */
+    char applicationUri[64];
+    snprintf(applicationUri, sizeof(applicationUri), APPLICATION_URI_FMT, deviceId);
+
+    bool secure = wantSecure && opcua_security_setup(&config, OPCUA_PORT, applicationUri, ip);
+    if(!secure) {
+        if(wantSecure) {
+            printf("[opcua] security could not be set up, running without it\n");
+            state_lock(); g_state.security_on = false; state_unlock();
+        }
+        UA_ServerConfig_setMinimal(&config, OPCUA_PORT, NULL);
+    }
 
     /* Who we are */
-    setString(&config.applicationDescription.applicationUri, APPLICATION_URI);
+    setString(&config.applicationDescription.applicationUri, applicationUri);
     setString(&config.applicationDescription.productUri, "urn:m5stack:core2");
     UA_LocalizedText_clear(&config.applicationDescription.applicationName);
     config.applicationDescription.applicationName =
@@ -550,6 +591,9 @@ void opcua_server_run(void) {
     buildAddressSpace(server);
     UA_Server_addRepeatedCallback(server, updateCallback, NULL, UPDATE_INTERVAL_MS, NULL);
 
+    /* Opening the listen socket needs internal RAM; log what is left */
+    printf("[opcua] starting, %u kB internal RAM free\n",
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     UA_StatusCode rc = UA_Server_run_startup(server);
     if(rc != UA_STATUSCODE_GOOD) {
         printf("[opcua] startup failed: %s\n", UA_StatusCode_name(rc));

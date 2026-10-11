@@ -38,6 +38,7 @@
 
 #include "device_state.h"
 #include "opcua_server.h"
+#include "security_store.h"
 #include "wifi_config.h"
 #include "wifi_net.h"
 
@@ -224,6 +225,10 @@ static void draw_top_bar(const device_state_t &s) {
         char c[20];
         snprintf(c, sizeof(c), "%u client%s", (unsigned)s.client_count, s.client_count == 1 ? "" : "s");
         canvas.drawString(c, 118, 13);
+        if(s.security_on) {  /* secure endpoints offered */
+            canvas.setTextColor(TFT_GREEN);
+            canvas.drawString("SEC", 186, 13);
+        }
     } else {
         canvas.setTextColor(TFT_ORANGE);
         canvas.drawString("Wi-Fi connecting...", 6, 13);
@@ -245,6 +250,20 @@ static void draw_bottom_bar(uint8_t page) {
         canvas.drawString(names[i], cx, 227);
     }
 }
+
+/* A rounded button with a centred label; highlight fills it with the accent
+ * colour (used for the main action of a dialog) */
+static void draw_button(int x, int y, int w, int h, const char *label, bool highlight) {
+    canvas.fillRoundRect(x, y, w, h, 8, highlight ? ACCENT : BAR_BG);
+    canvas.drawRoundRect(x, y, w, h, 8, DIM);
+    canvas.setFont(&fonts::DejaVu12);
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setTextColor(highlight ? BG : FG);
+    canvas.drawString(label, x + w / 2, y + h / 2);
+}
+
+/* "Security" button on the System page (opens the security menu) */
+static const int SEC_BTN_X = 222, SEC_BTN_Y = 190, SEC_BTN_W = 88, SEC_BTN_H = 24;
 
 /* On-screen buttons on the Main page (above the touch buttons A/B/C).
  * CTRL_Y/H/W give the row's top edge, height and each button's width. */
@@ -426,14 +445,129 @@ static void draw_page_system(const device_state_t &s) {
     canvas.setTextColor(ACCENT);
     if(s.ip_address[0]) snprintf(b, sizeof(b), "opc.tcp://%s:4840", s.ip_address);
     else snprintf(b, sizeof(b), "waiting for Wi-Fi (%s)", WIFI_SSID);
-    canvas.drawString(b, 10, 176);
+    canvas.drawString(b, 10, 174);
+    /* Device ID (end of the MAC): tells several Core2s apart */
     canvas.setTextColor(DIM);
-    canvas.drawString("Security: None (test mode)", 10, 194);
+    canvas.setTextDatum(textdatum_t::top_right);
+    snprintf(b, sizeof(b), "ID %s", s.device_id);
+    canvas.drawString(b, 310, 174);
+    canvas.setTextDatum(textdatum_t::top_left);
+
+    /* Security status, and the button that opens the security menu */
+    switch(s.security_status) {
+        case SEC_STATUS_CREATING_CERT: snprintf(b, sizeof(b), "Security: creating certificate..."); break;
+        case SEC_STATUS_READY:   snprintf(b, sizeof(b), "Security: ON, %u trusted", (unsigned)s.trusted_count); break;
+        case SEC_STATUS_ERROR:   snprintf(b, sizeof(b), "Security: FAILED, None only"); break;
+        default:                 snprintf(b, sizeof(b), "Security: off (None only)"); break;
+    }
+    canvas.setTextColor(s.security_on ? TFT_GREEN : (s.security_status == SEC_STATUS_ERROR ? TFT_RED : DIM));
+    canvas.drawString(b, 10, 194);
+    draw_button(SEC_BTN_X, SEC_BTN_Y, SEC_BTN_W, SEC_BTN_H, "Security", false);
 }
 
-/* Redraw the whole screen from a snapshot of the state, then push it to the
- * display in one transfer. */
-static void draw_screen(const device_state_t &s) {
+/* ------------------------------------------------------------------ */
+/* Dialogs (drawn over the page)                                       */
+/*                                                                    */
+/*   MODAL_APPROVE   an unknown client certificate: Trust / Reject.   */
+/*                   Opens by itself when the OPC UA task asks.       */
+/*   MODAL_SECURITY  menu from the System page's Security button      */
+/*   MODAL_CONFIRM_TOGGLE / _CLEAR  "the Core2 restarts" confirmation */
+/* While a dialog is open, taps only go to its buttons.               */
+/* ------------------------------------------------------------------ */
+enum { MODAL_NONE, MODAL_APPROVE, MODAL_SECURITY, MODAL_CONFIRM_TOGGLE, MODAL_CONFIRM_CLEAR };
+static const int DLG_X = 16, DLG_Y = 34, DLG_W = 288, DLG_H = 176;
+static const int DLG_BTN_H = 36, DLG_BTN_Y = DLG_Y + DLG_H - DLG_BTN_H - 10;
+
+/* Button labels for a dialog; returns how many (1..3). Button 0 is the
+ * "yes" action, the last one always cancels / closes. */
+static int dialog_buttons(int modal, const device_state_t &s, const char *labels[3]) {
+    switch(modal) {
+        case MODAL_APPROVE:
+            labels[0] = "Trust"; labels[1] = "Reject"; return 2;
+        case MODAL_SECURITY:
+            labels[0] = s.security_on ? "Turn off" : "Turn on";
+            labels[1] = "Clear trust"; labels[2] = "Close"; return 3;
+        default:
+            labels[0] = "Restart"; labels[1] = "Cancel"; return 2;
+    }
+}
+
+/* Left edge and width of dialog button i of n */
+static void dialog_button_rect(int i, int n, int *x, int *w) {
+    const int gap = 10;
+    *w = (DLG_W - 20 - (n - 1) * gap) / n;
+    *x = DLG_X + 10 + i * (*w + gap);
+}
+
+/* Which dialog button is at (x, y), or -1 */
+static int dialog_hit(int modal, const device_state_t &s, int x, int y) {
+    const char *labels[3];
+    int n = dialog_buttons(modal, s, labels);
+    if(y < DLG_BTN_Y || y >= DLG_BTN_Y + DLG_BTN_H) return -1;
+    for(int i = 0; i < n; i++) {
+        int bx, bw;
+        dialog_button_rect(i, n, &bx, &bw);
+        if(x >= bx && x < bx + bw) return i;
+    }
+    return -1;
+}
+
+static void draw_dialog(int modal, const device_state_t &s) {
+    if(modal == MODAL_NONE) return;
+    canvas.fillRoundRect(DLG_X, DLG_Y, DLG_W, DLG_H, 10, BAR_BG);
+    canvas.drawRoundRect(DLG_X, DLG_Y, DLG_W, DLG_H, 10, ACCENT);
+
+    const char *title = "", *line[3] = {"", "", ""};
+    char buf[3][64];
+    switch(modal) {
+        case MODAL_APPROVE:
+            title = "New OPC UA client";
+            snprintf(buf[0], sizeof(buf[0]), "%s", s.pending_client);
+            snprintf(buf[1], sizeof(buf[1]), "Certificate %s...", s.pending_thumb);
+            line[0] = buf[0]; line[1] = buf[1]; line[2] = "Trust this client?";
+            break;
+        case MODAL_SECURITY:
+            title = "Security";
+            line[0] = s.security_on ? "On: None + Sign + Sign&Encrypt"
+                                    : "Off: None endpoint only";
+            snprintf(buf[1], sizeof(buf[1]), "Trusted clients: %u", (unsigned)s.trusted_count);
+            line[1] = buf[1];
+            line[2] = "Changes restart the Core2.";
+            break;
+        case MODAL_CONFIRM_TOGGLE:
+            title = s.security_on ? "Turn security OFF?" : "Turn security ON?";
+            line[0] = s.security_on ? "Only the None endpoint will be left."
+                                    : "Adds signed + encrypted endpoints.";
+            line[1] = s.security_on ? "" : "First time: certificate takes ~1 min.";
+            line[2] = "The Core2 restarts.";
+            break;
+        case MODAL_CONFIRM_CLEAR:
+            title = "Forget trusted clients?";
+            snprintf(buf[0], sizeof(buf[0]), "All %u will have to be approved", (unsigned)s.trusted_count);
+            line[0] = buf[0]; line[1] = "again. The Core2 restarts.";
+            break;
+    }
+    canvas.setTextDatum(textdatum_t::top_center);
+    canvas.setFont(&fonts::DejaVu18);
+    canvas.setTextColor(ACCENT);
+    canvas.drawString(title, 160, DLG_Y + 10);
+    canvas.setFont(&fonts::DejaVu12);
+    canvas.setTextColor(FG);
+    for(int i = 0; i < 3; i++)
+        canvas.drawString(line[i], 160, DLG_Y + 40 + i * 20);
+
+    const char *labels[3];
+    int n = dialog_buttons(modal, s, labels);
+    for(int i = 0; i < n; i++) {
+        int bx, bw;
+        dialog_button_rect(i, n, &bx, &bw);
+        draw_button(bx, DLG_BTN_Y, bw, DLG_BTN_H, labels[i], i == 0);
+    }
+}
+
+/* Redraw the whole screen from a snapshot of the state (plus any open
+ * dialog), then push it to the display in one transfer. */
+static void draw_screen(const device_state_t &s, int modal) {
     canvas.fillScreen(BG);
     draw_top_bar(s);
     switch(s.page) {
@@ -442,7 +576,21 @@ static void draw_screen(const device_state_t &s) {
         default: draw_page_main(s);   break;
     }
     draw_bottom_bar(s.page);
+    draw_dialog(modal, s);
     canvas.pushSprite(0, 0);
+}
+
+/* Show a full-screen message and restart the chip (used after a security
+ * change, which only takes effect at start-up) */
+static void restart_with_message(const char *msg) {
+    canvas.fillScreen(BG);
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setFont(&fonts::DejaVu18);
+    canvas.setTextColor(ACCENT);
+    canvas.drawString(msg, 160, 110);
+    canvas.pushSprite(0, 0);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_restart();
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,6 +617,7 @@ static void hw_task(void *) {
     uint32_t last_sensor_ms = 0, last_draw_ms = 0;
     uint32_t last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000); /* last touch or client change */
     bool     asleep = false;             /* screen + lights off because of idle timeout */
+    int      modal = MODAL_NONE;         /* open dialog, see "Dialogs" above */
 
     for(;;) {
         M5.update(); /* touch + buttons */
@@ -482,21 +631,58 @@ static void hw_task(void *) {
 
         auto t = M5.Touch.getDetail();
         bool touched = M5.Touch.getCount() > 0;
-        int ctrl = (touched && t.wasPressed()) ? ctrl_hit(t.x, t.y) : -1;
+        bool tap = touched && t.wasPressed();
+        int ctrl = (tap && modal == MODAL_NONE) ? ctrl_hit(t.x, t.y) : -1;
 
         /* --- idle sleep: any touch is activity. The touch that wakes the
          *     screen only wakes it, so it can't change page or press a button. --- */
         if(touched) {
             last_activity_ms = now_ms;
-            if(asleep) { pressed = -1; ctrl = -1; }
+            if(asleep) { pressed = -1; ctrl = -1; tap = false; }
         }
+        /* While a dialog is open the A/B/C page buttons do nothing */
+        if(modal != MODAL_NONE) pressed = -1;
 
+        enum { ACT_NONE, ACT_TOGGLE_SECURITY, ACT_CLEAR_TRUST } action = ACT_NONE;
+        int old_modal = modal;
         state_lock();
         if(g_state.wake_request) {  /* a client changed something */
             g_state.wake_request = false;
             last_activity_ms = now_ms;
         }
         uint32_t idle_timeout_s = g_state.idle_timeout_s;
+
+        /* --- dialogs --- */
+        /* The OPC UA task wants a client certificate approved: ask now */
+        bool ask = g_state.approval_pending && g_state.approval_decision == APPROVAL_NONE;
+        if(ask && modal != MODAL_APPROVE) modal = MODAL_APPROVE;
+        else if(!ask && modal == MODAL_APPROVE) modal = MODAL_NONE;
+        if(modal != MODAL_NONE && tap) {
+            switch(dialog_hit(modal, g_state, t.x, t.y)) {
+                case 0:  /* first button: the action */
+                    if(modal == MODAL_APPROVE)             { g_state.approval_decision = APPROVAL_TRUST; modal = MODAL_NONE; }
+                    else if(modal == MODAL_SECURITY)       modal = MODAL_CONFIRM_TOGGLE;
+                    else if(modal == MODAL_CONFIRM_TOGGLE) action = ACT_TOGGLE_SECURITY;
+                    else if(modal == MODAL_CONFIRM_CLEAR)  action = ACT_CLEAR_TRUST;
+                    break;
+                case 1:
+                    if(modal == MODAL_APPROVE)        { g_state.approval_decision = APPROVAL_REJECT; modal = MODAL_NONE; }
+                    else if(modal == MODAL_SECURITY)  modal = MODAL_CONFIRM_CLEAR;
+                    else                              modal = MODAL_NONE;  /* Cancel */
+                    break;
+                case 2:  /* Close */
+                    modal = MODAL_NONE;
+                    break;
+                default: /* tap outside the buttons */
+                    break;
+            }
+        } else if(modal == MODAL_NONE && tap && g_state.page == 2 &&
+                  t.x >= SEC_BTN_X && t.x < SEC_BTN_X + SEC_BTN_W &&
+                  t.y >= SEC_BTN_Y && t.y < SEC_BTN_Y + SEC_BTN_H) {
+            modal = MODAL_SECURITY;
+        }
+        bool security_on = g_state.security_on;
+
         /* --- on-screen buttons (Main page only) --- */
         if(g_state.page == 0 && ctrl == CTRL_LIGHT) {
             g_state.lights_on = !g_state.lights_on;
@@ -527,6 +713,16 @@ static void hw_task(void *) {
         uint8_t want_lights_bright = g_state.lights_brightness;
         bool    want_mic = g_state.mic_enabled;
         state_unlock();
+
+        /* --- confirmed security changes: save to flash and restart (they
+         *     only take effect at start-up) --- */
+        if(action == ACT_TOGGLE_SECURITY) {
+            sec_store_set_enabled(!security_on);
+            restart_with_message(security_on ? "Security off - restarting" : "Security on - restarting");
+        } else if(action == ACT_CLEAR_TRUST) {
+            sec_store_clear_trusted();
+            restart_with_message("Trust list cleared - restarting");
+        }
 
         /* --- microphone on/off (Microphone.Enabled over OPC UA) --- */
         if(want_mic != applied_mic) {
@@ -620,11 +816,11 @@ static void hw_task(void *) {
         }
 
         /* --- redraw at ~5 fps, or right away after a button or screen tap --- */
-        if(!asleep && (pressed >= 0 || ctrl >= 0 || now_ms - last_draw_ms >= 200)) {
+        if(!asleep && (pressed >= 0 || ctrl >= 0 || modal != old_modal || now_ms - last_draw_ms >= 200)) {
             last_draw_ms = now_ms;
             device_state_t snap;
             state_lock(); snap = g_state; state_unlock();
-            draw_screen(snap);
+            draw_screen(snap, modal);
         }
 
         vTaskDelay(pdMS_TO_TICKS(asleep ? 50 : 20)); /* 50 ms still wakes on touch quickly */
@@ -699,10 +895,22 @@ extern "C" void app_main(void) {
         settimeofday(&tv, nullptr);
     }
 
+    /* Device ID (end of the MAC): makes the hostname and ApplicationUri unique */
+    wifi_device_id(g_state.device_id);
     wifi_start();
 
+    /* Security setting and trust list live in their own flash partition.
+     * security_on is what the OPC UA task sets up; it clears it again if
+     * the secure setup fails. */
+    if(sec_store_init()) {
+        g_state.security_on = sec_store_get_enabled();
+        g_state.trusted_count = (uint32_t)sec_store_trusted_count();
+    }
+    ESP_LOGI(TAG, "security %s", g_state.security_on ? "on" : "off");
+
     /* hw on core 1, OPC UA on core 0 (with the Wi-Fi stack). The OPC UA task
-     * needs the bigger stack: open62541 builds responses on the stack. */
+     * needs the bigger stack: open62541 builds responses on the stack, and
+     * the RSA/certificate code needs room too. */
     xTaskCreatePinnedToCore(hw_task, "hw", 8192, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(opcua_task, "opcua", 24576, nullptr, 5, nullptr, 0);
+    xTaskCreatePinnedToCore(opcua_task, "opcua", 32768, nullptr, 5, nullptr, 0);
 }

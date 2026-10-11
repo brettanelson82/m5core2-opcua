@@ -56,6 +56,8 @@ typedef struct {
     uint32_t free_heap;         /* bytes, internal RAM + PSRAM */
     int32_t  wifi_rssi;         /* dBm, 0 while disconnected */
     char     ip_address[16];    /* e.g. "192.168.1.20"; "" while disconnected (written by wifi_net.c) */
+    char     device_id[8];      /* last 3 bytes of the Wi-Fi MAC as hex, e.g. "a1b2c3": makes the
+                                   hostname and ApplicationUri unique per device (set in app_main) */
     uint32_t client_count;      /* OPC UA sessions currently open (written by the OPC UA task) */
 
     /* ---------- Display ---------- */
@@ -77,7 +79,23 @@ typedef struct {
     /* ---------- One-shot commands: set by the requester, cleared by the hw task ---------- */
     uint32_t vibrate_request_ms; /* >0 : vibrate for this long (Vibrate method or Buzz button) */
     bool     wake_request;       /* a client changed something: counts as activity */
+
+    /* ---------- Security (see opcua_security.c) ---------- */
+    bool     security_on;        /* secure endpoints active since start-up (set by app_main
+                                    from flash, cleared by the OPC UA task if setup fails) */
+    uint8_t  security_status;    /* SEC_STATUS_* below, set by the OPC UA task */
+    uint32_t trusted_count;      /* client certificates trusted so far */
+    /* Approval of an unknown client certificate:
+     * OPC UA task fills pending_client and sets approval_pending; the screen asks
+     * the user and sets approval_decision; the OPC UA task acts and clears both. */
+    bool     approval_pending;
+    char     pending_client[48]; /* certificate name (CN) to show the user */
+    char     pending_thumb[12];  /* start of its SHA-1 thumbprint, to tell certs apart */
+    uint8_t  approval_decision;  /* APPROVAL_* below */
 } device_state_t;
+
+enum { SEC_STATUS_OFF, SEC_STATUS_CREATING_CERT, SEC_STATUS_READY, SEC_STATUS_ERROR };
+enum { APPROVAL_NONE, APPROVAL_TRUST, APPROVAL_REJECT };
 
 /* The single instance, defined in main.cpp */
 extern device_state_t g_state;

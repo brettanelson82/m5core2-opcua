@@ -9,7 +9,7 @@ such as UaExpert can write a value that the Core2 then shows on its screen.
 | Framework | ESP-IDF **v5.5** (tested with v5.5.5; the VS Code ESP-IDF extension installs it) |
 | OPC UA stack | open62541 v1.5.8, already included (nothing to download) |
 | Hardware library | M5Unified (downloaded automatically on the first build) |
-| Endpoint | `opc.tcp://<ip-shown-on-screen>:4840`, Security **None** (for testing) |
+| Endpoint | `opc.tcp://<ip-shown-on-screen>:4840`, Security **None**, plus signed and encrypted endpoints when [security](#security-optional) is switched on |
 
 ---
 
@@ -85,7 +85,8 @@ the colour with **Red**, **Green** and **Blue** (0–255 each).
   - **B – Motion:** accelerometer and gyroscope with live bars, plus tilt (pitch / roll).
     The accelerometer always includes gravity, so a tilted Core2 shows a steady reading.
     The gyroscope only reads while it is turning.
-  - **C – System:** battery voltage/current, USB voltage, local time, uptime, Wi-Fi signal, free memory, endpoint URL
+  - **C – System:** battery voltage/current, USB voltage, local time, uptime, Wi-Fi signal, free memory, endpoint URL,
+    device ID, security status and the **Security** button
 
 ## Address space
 
@@ -98,7 +99,7 @@ Namespace URI `urn:m5stack:core2:opcua` (namespace index 2). All NodeIds are str
 | Microphone | SoundLevel (dBFS), **Enabled** | 0 = loudest, about −90 = silence. Off by default to save battery (reads −96) |
 | Touch | ButtonA/B/C, ButtonA/B/CCount, IsTouched, X, Y | |
 | Clock | RtcTime (DateTime, UTC) | set from the internet (NTP) at boot, kept by the RTC chip |
-| System | Uptime, FreeHeap, WifiRssi, IpAddress, ClientCount, FirmwareVersion | |
+| System | Uptime, FreeHeap, WifiRssi, IpAddress, ClientCount, FirmwareVersion, DeviceId, SecurityEnabled | |
 | Display | **Value**, **Label**, **Unit**, **Brightness**, Page, **IdleTimeout** (s), Asleep | **bold = writable**. IdleTimeout 0 = never sleep |
 | Lights | **On**, **Red**, **Green**, **Blue**, **Brightness** | the 10 side LEDs on the M5GO Bottom2 base; the screen buttons change these too |
 | Outputs | **Vibrate(DurationMs)** method | max 5000 ms |
@@ -118,11 +119,13 @@ main/
   main.cpp          sensors, touch buttons, screen drawing
   opcua_server.c    OPC UA address space and server
   ns0_fixups.c      fills standard (namespace 0) values left empty by this open62541 build
-  wifi_net.c        Wi-Fi connection and clock sync
+  opcua_security.c  optional security: endpoints, server certificate, client approval
+  security_store.c  security setting, certificates and trust list in flash
+  wifi_net.c        Wi-Fi connection, device ID / hostname, clock sync
   device_state.h    data shared between the screen and the server
-components/open62541/   OPC UA stack (single-file build, see its README)
-sdkconfig.defaults  Core2 settings: 16 MB flash, 8 MB PSRAM, sockets, 802.11r
-partitions.csv      6 MB app partition
+components/open62541/   OPC UA stack with mbedTLS encryption (single-file build, see its README)
+sdkconfig.defaults  Core2 settings: 16 MB flash, 8 MB PSRAM, sockets, 802.11r, power saving, mbedTLS in PSRAM
+partitions.csv      6 MB app partition, plus "certs" for the security data
 .vscode/            ESP-IDF extension, IntelliSense and serial port settings
 ```
 
@@ -154,7 +157,38 @@ The bundled OPC UA stack in `components/open62541/` is [open62541](https://open6
 v1.5.8 under the Mozilla Public License 2.0 ([its license](components/open62541/LICENSE)),
 with one small local change (see [its README](components/open62541/README.md)).
 
-## Next step: certificates
+## Security (optional)
 
-Security is **None** for now, so anyone on your network can read and write.
-The next stage is adding the Basic256Sha256 *Sign & Encrypt* endpoint
+Security is **off** by default: only the *None* endpoint, so anyone on your network can read and write.
+
+**Turn it on:** System page (button C) → **Security** → **Turn on** → **Restart**. The first time,
+the Core2 creates its own certificate (a few seconds), and the top bar then shows **SEC**.
+The server now offers:
+
+| Policy | Modes |
+|---|---|
+| None | None (still offered, for clients without certificates) |
+| Basic256Sha256 | Sign, Sign & Encrypt |
+| Aes128_Sha256_RsaOaep | Sign, Sign & Encrypt |
+| Aes256_Sha256_RsaPss | Sign, Sign & Encrypt |
+
+Login is anonymous in every mode.
+
+**Connecting a client with security** (UaExpert, Matrikon, 800xA, ...):
+1. Choose one of the secure endpoints. The first attempt is refused, because the Core2 doesn't know the client yet.
+2. The Core2 screen shows **New OPC UA client – Trust this client?** with the certificate's name. Tap **Trust**.
+3. Connect again. The client may ask you to accept the Core2's certificate too; accept it.
+
+Trusted clients are saved in flash (up to 16). **Security → Clear trust** forgets them all.
+**Security → Turn off** goes back to None only. Each change restarts the Core2.
+
+**Good to know**
+- Each Core2 has a **device ID** (last 3 bytes of its MAC, shown on the System page). The hostname
+  `m5core2-<id>`, the ApplicationUri `urn:m5stack:core2:opcua:<id>:server` and the certificate all
+  contain it, so several Core2s can share a network. The node namespace `urn:m5stack:core2:opcua` is the
+  same on every device.
+- The certificate also contains the IP address the Core2 had when it was created. If the IP changes, some
+  clients warn about a host name mismatch. Connecting by `m5core2-<id>` or giving the Core2 a fixed IP
+  (DHCP reservation) avoids that.
+- The private key is stored in flash unencrypted. Anyone with the device and a USB cable could read it out.
+- Unknown clients are asked about once per boot. If you tapped **Reject** by mistake, restart the Core2 and connect again.

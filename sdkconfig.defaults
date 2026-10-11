@@ -30,3 +30,7 @@ CONFIG_ESP_WIFI_11R_SUPPORT=y
 
 # ---- Battery: let the CPU slow down when idle (configured in app_main) ----
 CONFIG_PM_ENABLE=y
+
+# ---- Security: mbedTLS (RSA, certificates) uses PSRAM, keeping internal RAM ----
+# ---- free for Wi-Fi and network sockets                                      ----
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
